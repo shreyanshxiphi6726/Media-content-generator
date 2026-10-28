@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { 
   ChevronLeft, Wand2, Image as ImageIcon, Palette, 
   Layers, ChevronDown, Folder, Save, FilePlus, 
@@ -12,8 +12,12 @@ export default function Editor({ onBack }) {
   const [activeDropdown, setActiveDropdown] = useState(null);
   const [activeSubMenu, setActiveSubMenu] = useState(null);
   const [isToolDrawerOpen, setIsToolDrawerOpen] = useState(true);
-  const [history, setHistory] = useState([]);
-  const [future, setFuture] = useState([]);
+  const [history, setHistory] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('mcp-editor-history') || '[]').slice(-10); } catch { return []; }
+  });
+  const [future, setFuture] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('mcp-editor-future') || '[]').slice(0, 10); } catch { return []; }
+  });
   const [showGrid, setShowGrid] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [canvasElements, setCanvasElements] = useState([]);
@@ -22,6 +26,11 @@ export default function Editor({ onBack }) {
   const [projectId, setProjectId] = useState(null);
   const [projectName, setProjectName] = useState('Untitled Design');
   const uploadInputRef = useRef(null);
+  const mcpInputRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [mcpFileHandle, setMcpFileHandle] = useState(null);
+  const [selectedElementId, setSelectedElementId] = useState(null);
+  const [dragState, setDragState] = useState(null);
   
   // Left Sidebar Panel State
   const [activeSidebarTool, setActiveSidebarTool] = useState('ratio');
@@ -36,8 +45,7 @@ export default function Editor({ onBack }) {
   };
 
   const handleRatioChange = (width, height, name) => {
-    setHistory((items) => [...items, canvasDimensions]);
-    setFuture([]);
+    recordHistory();
     setCanvasDimensions({ width, height, name });
   };
 
@@ -47,14 +55,14 @@ export default function Editor({ onBack }) {
   };
 
   const handleNew = () => {
-    setHistory([]);
-    setFuture([]);
+    recordHistory();
     setCanvasElements([]);
     setCanvasBackground('#ffffff');
     setCanvasDimensions({ width: '600px', height: '400px', name: '16:9 Landscape' });
     setProjectId(null);
-    setProjectName('Untitled Design');
-    notify('New local design created');
+    setProjectName('Untitled');
+    setMcpFileHandle(null);
+    notify('New blank .mcp design created');
   };
 
   const getDocument = () => ({
@@ -65,66 +73,148 @@ export default function Editor({ onBack }) {
     zoom,
   });
 
+  const recordHistory = () => {
+    setHistory((items) => [...items, getDocument()].slice(-10));
+    setFuture([]);
+  };
+
+  const restoreDocument = (document) => {
+    setCanvasDimensions(document.canvasDimensions || { width: '600px', height: '400px', name: '16:9 Landscape' });
+    setCanvasBackground(document.canvasBackground || '#ffffff');
+    setCanvasElements(document.canvasElements || []);
+    setShowGrid(Boolean(document.showGrid));
+    setZoom(document.zoom || 1);
+  };
+
+  useEffect(() => {
+    localStorage.setItem('mcp-editor-history', JSON.stringify(history.slice(-10)));
+    localStorage.setItem('mcp-editor-future', JSON.stringify(future.slice(0, 10)));
+  }, [history, future]);
+
   const loadDocument = (project) => {
     const document = project.document || {};
     setProjectId(project.id);
     setProjectName(project.name || 'Untitled Design');
     if (document.canvasDimensions) setCanvasDimensions(document.canvasDimensions);
     if (document.canvasBackground) setCanvasBackground(document.canvasBackground);
-    setCanvasElements(document.canvasElements || []);
+    setCanvasElements((document.canvasElements || []).map((element, index) => ({
+      x: 40 + (index % 2) * 180,
+      y: 40 + Math.floor(index / 2) * 70,
+      fontSize: 24,
+      fontWeight: '400',
+      fontStyle: 'normal',
+      color: '#0f172a',
+      textAlign: 'left',
+      visible: true,
+      ...element,
+    })));
     setShowGrid(Boolean(document.showGrid));
     setZoom(document.zoom || 1);
     setHistory([]);
     setFuture([]);
   };
 
+  const getMcpFile = () => ({
+    format: 'mcp',
+    version: 1,
+    name: projectName || 'Untitled',
+    document: getDocument(),
+  });
+
   const handleSave = async () => {
+    const content = JSON.stringify(getMcpFile(), null, 2);
     try {
-      const response = await fetch(projectId ? `${API_URL}/api/projects/${projectId}` : `${API_URL}/api/projects`, {
-        method: projectId ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: projectName, document: getDocument() }),
-      });
-      if (!response.ok) throw new Error('Save failed');
-      const project = await response.json();
-      setProjectId(project.id);
-      notify('Design saved to MongoDB');
+      if ('showSaveFilePicker' in window) {
+        const handle = mcpFileHandle || await window.showSaveFilePicker({
+          suggestedName: `${projectName || 'Untitled'}.mcp`,
+          types: [{ description: 'Media Canvas Project', accept: { 'application/json': ['.mcp'] } }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(content);
+        await writable.close();
+        setMcpFileHandle(handle);
+        setProjectName(handle.name.replace(/\.mcp$/i, '') || 'Untitled');
+        notify('Design saved as .mcp');
+        return;
+      }
+
+      const blob = new Blob([content], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${projectName || 'Untitled'}.mcp`;
+      link.click();
+      URL.revokeObjectURL(url);
+      notify('Design downloaded as .mcp');
     } catch {
-      notify('Backend unavailable; start the FastAPI server first');
+      notify('Save cancelled');
+    }
+  };
+
+  const applyMcpFile = async (file, handle = null) => {
+    try {
+      const data = JSON.parse(await file.text());
+      if (data.format !== 'mcp' || !data.document) throw new Error('Invalid MCP file');
+      loadDocument({ id: null, name: data.name || file.name.replace(/\.mcp$/i, ''), document: data.document });
+      setMcpFileHandle(handle);
+      notify(`Opened ${file.name}`);
+    } catch {
+      notify('That file is not a valid .mcp project');
     }
   };
 
   const handleOpen = async () => {
     try {
-      const response = await fetch(`${API_URL}/api/projects`);
-      if (!response.ok) throw new Error('Load failed');
-      const projects = await response.json();
-      if (!projects.length) return notify('No saved designs found');
-      loadDocument(projects[0]);
-      notify(`Loaded ${projects[0].name}`);
+      if ('showOpenFilePicker' in window) {
+        const [handle] = await window.showOpenFilePicker({
+          multiple: false,
+          types: [{ description: 'Media Canvas Project', accept: { 'application/json': ['.mcp'] } }],
+        });
+        await applyMcpFile(await handle.getFile(), handle);
+        return;
+      }
+      mcpInputRef.current?.click();
     } catch {
-      notify('Could not load designs from the backend');
+      notify('Open cancelled');
     }
+  };
+
+  const handleMcpInput = (event) => {
+    const file = event.target.files?.[0];
+    if (file) applyMcpFile(file);
+    event.target.value = '';
   };
 
   const handleUndo = () => {
     if (!history.length) return notify('Nothing to undo');
     const previous = history[history.length - 1];
     setHistory((items) => items.slice(0, -1));
-    setFuture((items) => [canvasDimensions, ...items]);
-    setCanvasDimensions(previous);
+    setFuture((items) => [getDocument(), ...items].slice(0, 10));
+    restoreDocument(previous);
   };
 
   const handleRedo = () => {
     if (!future.length) return notify('Nothing to redo');
     const next = future[0];
     setFuture((items) => items.slice(1));
-    setHistory((items) => [...items, canvasDimensions]);
-    setCanvasDimensions(next);
+    setHistory((items) => [...items, getDocument()].slice(-10));
+    restoreDocument(next);
   };
 
+  useEffect(() => {
+    const handleShortcut = (event) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      if (event.key.toLowerCase() === 'z') {
+        event.preventDefault();
+        event.shiftKey ? handleRedo() : handleUndo();
+      }
+    };
+    window.addEventListener('keydown', handleShortcut);
+    return () => window.removeEventListener('keydown', handleShortcut);
+  }, [history, future]);
+
   const handleExport = (format = 'SVG') => {
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${canvasDimensions.width}" height="${canvasDimensions.height}" viewBox="0 0 600 400"><rect width="100%" height="100%" fill="white"/><text x="300" y="220" text-anchor="middle" font-family="sans-serif" font-size="48" font-weight="800" fill="#0f172a">Hello World</text></svg>`;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${canvasDimensions.width}" height="${canvasDimensions.height}" viewBox="0 0 600 400"><rect width="100%" height="100%" fill="${canvasBackground}"/></svg>`;
     const blob = new Blob([svg], { type: 'image/svg+xml' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -136,8 +226,81 @@ export default function Editor({ onBack }) {
   };
 
   const addCanvasElement = (label, type = 'text') => {
-    setCanvasElements((items) => [...items, { id: Date.now(), label, type }]);
+    recordHistory();
+    setCanvasElements((items) => [...items, {
+      id: Date.now(), label, type,
+      x: 40 + (items.length % 2) * 180,
+      y: 40 + Math.floor(items.length / 2) * 70,
+      fontSize: 24,
+      fontWeight: '400',
+      fontStyle: 'normal',
+      color: '#0f172a',
+      textAlign: 'left',
+      visible: true,
+    }]);
     notify(`${label} added to canvas`);
+  };
+
+  const addTextElement = (label, fontSize, fontWeight = '400') => {
+    recordHistory();
+    const id = Date.now();
+    setCanvasElements((items) => [...items, {
+      id, label, type: 'text', x: 50, y: 50 + items.length * 50,
+      fontSize, fontWeight, fontStyle: 'normal', color: '#0f172a', textAlign: 'left',
+      visible: true,
+    }]);
+    setSelectedElementId(id);
+    notify(`${label} added to canvas`);
+  };
+
+  const selectedElement = canvasElements.find((element) => element.id === selectedElementId);
+
+  const updateElement = (id, changes, saveHistory = true) => {
+    if (saveHistory) recordHistory();
+    setCanvasElements((items) => items.map((element) => (
+      element.id === id ? { ...element, ...changes } : element
+    )));
+  };
+
+  const deleteElement = (id) => {
+    recordHistory();
+    setCanvasElements((items) => items.filter((element) => element.id !== id));
+    if (selectedElementId === id) setSelectedElementId(null);
+    notify('Layer deleted');
+  };
+
+  const moveElement = (id, direction) => {
+    recordHistory();
+    setCanvasElements((items) => {
+      const index = items.findIndex((element) => element.id === id);
+      const nextIndex = index + direction;
+      if (index < 0 || nextIndex < 0 || nextIndex >= items.length) return items;
+      const next = [...items];
+      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+      return next;
+    });
+  };
+
+  const handleElementDragStart = (event, element) => {
+    event.stopPropagation();
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setSelectedElementId(element.id);
+    setDragState({
+      id: element.id,
+      offsetX: (event.clientX - rect.left) / zoom - (element.x || 0),
+      offsetY: (event.clientY - rect.top) / zoom - (element.y || 0),
+    });
+    recordHistory();
+  };
+
+  const handleCanvasPointerMove = (event) => {
+    if (!dragState || !canvasRef.current) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    updateElement(dragState.id, {
+      x: Math.max(0, (event.clientX - rect.left) / zoom - dragState.offsetX),
+      y: Math.max(0, (event.clientY - rect.top) / zoom - dragState.offsetY),
+    }, false);
   };
 
   const handleUpload = (event) => {
@@ -145,11 +308,15 @@ export default function Editor({ onBack }) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
+      recordHistory();
       setCanvasElements((items) => [...items, {
         id: Date.now(),
         label: file.name,
         type: 'image',
         src: reader.result,
+        x: 40,
+        y: 40 + items.length * 30,
+        visible: true,
       }]);
       notify(`${file.name} added to canvas`);
     };
@@ -190,7 +357,7 @@ export default function Editor({ onBack }) {
               {activeDropdown === 'file' && (
                 <div style={editorStyles.dropdownMenu}>
                   <div style={editorStyles.dropdownItem} onClick={handleNew}><FilePlus size={14} /> New</div>
-                  <div style={editorStyles.dropdownItem} onClick={handleOpen}><Folder size={14} /> Open latest</div>
+                  <div style={editorStyles.dropdownItem} onClick={handleOpen}><Folder size={14} /> Open .mcp</div>
                   <div style={editorStyles.dropdownItem} onClick={handleSave}><Save size={14} /> Save</div>
                   
                   <div 
@@ -275,10 +442,10 @@ export default function Editor({ onBack }) {
               </button>
               {activeDropdown === 'view' && (
                 <div style={editorStyles.dropdownMenu}>
-                  <div style={editorStyles.dropdownItem} onClick={() => setShowGrid((value) => !value)}><Eye size={14} /> Toggle Grid</div>
-                  <div style={editorStyles.dropdownItem} onClick={() => setZoom((value) => Math.min(1.5, value + 0.1))}>Zoom In (+)</div>
-                  <div style={editorStyles.dropdownItem} onClick={() => setZoom((value) => Math.max(0.5, value - 0.1))}>Zoom Out (-)</div>
-                  <div style={editorStyles.dropdownItem} onClick={() => setZoom(1)}>Reset Zoom</div>
+                  <div style={editorStyles.dropdownItem} onClick={() => { recordHistory(); setShowGrid((value) => !value); }}><Eye size={14} /> Toggle Grid</div>
+                  <div style={editorStyles.dropdownItem} onClick={() => { recordHistory(); setZoom((value) => Math.min(1.5, value + 0.1)); }}>Zoom In (+)</div>
+                  <div style={editorStyles.dropdownItem} onClick={() => { recordHistory(); setZoom((value) => Math.max(0.5, value - 0.1)); }}>Zoom Out (-)</div>
+                  <div style={editorStyles.dropdownItem} onClick={() => { recordHistory(); setZoom(1); }}>Reset Zoom</div>
                 </div>
               )}
             </div>
@@ -452,9 +619,28 @@ export default function Editor({ onBack }) {
           {activeSidebarTool === 'text' && (
             <div>
               <h3 style={editorStyles.drawerTitle}>Text Studio</h3>
-              <button style={editorStyles.drawerActionBtn} onClick={() => addCanvasElement('Heading')}>+ Add Heading</button>
-              <button style={editorStyles.drawerActionBtn} onClick={() => addCanvasElement('Subheading')}>+ Add Subheading</button>
-              <button style={editorStyles.drawerActionBtn} onClick={() => addCanvasElement('Body Text')}>+ Add Body Text</button>
+              <button style={editorStyles.drawerActionBtn} onClick={() => addTextElement('Heading', 32, '700')}>+ Add Heading</button>
+              <button style={editorStyles.drawerActionBtn} onClick={() => addTextElement('Subheading', 24, '600')}>+ Add Subheading</button>
+              <button style={editorStyles.drawerActionBtn} onClick={() => addTextElement('Body Text', 16)}>+ Add Body Text</button>
+              {selectedElement?.type === 'text' && (
+                <div style={editorStyles.formatPanel}>
+                  <h4 style={editorStyles.formatTitle}>Format selected text</h4>
+                  <label style={editorStyles.fieldLabel}>Font size
+                    <input type="number" min="8" max="120" value={selectedElement.fontSize || 24} onChange={(event) => updateElement(selectedElement.id, { fontSize: Number(event.target.value) })} style={editorStyles.fieldInput} />
+                  </label>
+                  <label style={editorStyles.fieldLabel}>Color
+                    <input type="color" value={selectedElement.color || '#0f172a'} onChange={(event) => updateElement(selectedElement.id, { color: event.target.value })} style={editorStyles.colorInput} />
+                  </label>
+                  <div style={editorStyles.formatButtons}>
+                    <button style={editorStyles.smallFormatButton} onClick={() => updateElement(selectedElement.id, { fontWeight: selectedElement.fontWeight === '700' ? '400' : '700' })}><strong>B</strong></button>
+                    <button style={editorStyles.smallFormatButton} onClick={() => updateElement(selectedElement.id, { fontStyle: selectedElement.fontStyle === 'italic' ? 'normal' : 'italic' })}><em>I</em></button>
+                    <button style={editorStyles.smallFormatButton} onClick={() => updateElement(selectedElement.id, { textAlign: 'left' })}>L</button>
+                    <button style={editorStyles.smallFormatButton} onClick={() => updateElement(selectedElement.id, { textAlign: 'center' })}>C</button>
+                    <button style={editorStyles.smallFormatButton} onClick={() => updateElement(selectedElement.id, { textAlign: 'right' })}>R</button>
+                  </div>
+                  <p style={editorStyles.drawerSubtitle}>Drag text directly on the canvas. Click the text to edit it.</p>
+                </div>
+              )}
             </div>
           )}
 
@@ -477,9 +663,9 @@ export default function Editor({ onBack }) {
             <div>
               <h3 style={editorStyles.drawerTitle}>Color Palette</h3>
               <p style={editorStyles.drawerSubtitle}>Set canvas background color</p>
-              <button style={{ ...editorStyles.colorSwatch, backgroundColor: '#ffffff' }} onClick={() => setCanvasBackground('#ffffff')}>White</button>
-              <button style={{ ...editorStyles.colorSwatch, backgroundColor: '#fef3c7' }} onClick={() => setCanvasBackground('#fef3c7')}>Warm</button>
-              <button style={{ ...editorStyles.colorSwatch, backgroundColor: '#dbeafe' }} onClick={() => setCanvasBackground('#dbeafe')}>Blue</button>
+              <button style={{ ...editorStyles.colorSwatch, backgroundColor: '#ffffff' }} onClick={() => { recordHistory(); setCanvasBackground('#ffffff'); }}>White</button>
+              <button style={{ ...editorStyles.colorSwatch, backgroundColor: '#fef3c7' }} onClick={() => { recordHistory(); setCanvasBackground('#fef3c7'); }}>Warm</button>
+              <button style={{ ...editorStyles.colorSwatch, backgroundColor: '#dbeafe' }} onClick={() => { recordHistory(); setCanvasBackground('#dbeafe'); }}>Blue</button>
             </div>
           )}
 
@@ -487,16 +673,35 @@ export default function Editor({ onBack }) {
             <div>
               <h3 style={editorStyles.drawerTitle}>Layers Manager</h3>
               <p style={editorStyles.drawerSubtitle}>{canvasElements.length} local element{canvasElements.length === 1 ? '' : 's'}</p>
-              {canvasElements.map((element) => <div key={element.id} style={editorStyles.layerItem}>{element.label}</div>)}
+              {[...canvasElements].reverse().map((element, reversedIndex) => (
+                <div key={element.id} style={{ ...editorStyles.layerItem, ...(selectedElementId === element.id ? editorStyles.layerItemActive : {}) }} onClick={() => setSelectedElementId(element.id)}>
+                  <input
+                    value={element.label}
+                    onChange={(event) => updateElement(element.id, { label: event.target.value })}
+                    onClick={(event) => event.stopPropagation()}
+                    style={editorStyles.layerNameInput}
+                    aria-label={`Rename ${element.label}`}
+                  />
+                  <div style={editorStyles.layerControls}>
+                    <button style={editorStyles.layerButton} onClick={(event) => { event.stopPropagation(); updateElement(element.id, { visible: element.visible === false }); }} title="Toggle visibility">{element.visible === false ? '◌' : '◉'}</button>
+                    <button style={editorStyles.layerButton} onClick={(event) => { event.stopPropagation(); moveElement(element.id, 1); }} disabled={reversedIndex === canvasElements.length - 1} title="Move up">↑</button>
+                    <button style={editorStyles.layerButton} onClick={(event) => { event.stopPropagation(); moveElement(element.id, -1); }} disabled={reversedIndex === 0} title="Move down">↓</button>
+                    <button style={editorStyles.layerDeleteButton} onClick={(event) => { event.stopPropagation(); deleteElement(element.id); }} title="Delete layer">×</button>
+                  </div>
+                </div>
+              ))}
             </div>
           )}
 
         </div>
 
         {/* 3. Central Canvas Area */}
-        <main style={editorStyles.canvasArea}>
+        <main style={editorStyles.canvasArea} onMouseMove={handleCanvasPointerMove} onMouseUp={() => setDragState(null)}>
           <input ref={uploadInputRef} type="file" accept="image/*" onChange={handleUpload} style={{ display: 'none' }} />
+          <input ref={mcpInputRef} type="file" accept=".mcp,application/json" onChange={handleMcpInput} style={{ display: 'none' }} />
           <div 
+            ref={canvasRef}
+            onMouseDown={() => setSelectedElementId(null)}
             style={{ 
               ...editorStyles.canvas, 
               width: canvasDimensions.width, 
@@ -508,11 +713,26 @@ export default function Editor({ onBack }) {
               transition: 'all 0.3s ease-in-out'
             }}
           >
-            <h1 style={editorStyles.helloWorldText}>Hello World</h1>
             {canvasElements.map((element) => (
-              element.type === 'image'
-                ? <img key={element.id} src={element.src} alt={element.label} title={element.label} style={editorStyles.canvasImage} />
-                : <div key={element.id} style={element.type === 'shape' ? editorStyles.canvasShape : element.type === 'ai' ? editorStyles.canvasAi : editorStyles.canvasElement}>{element.label}</div>
+              element.visible === false ? null : element.type === 'image'
+                ? <img key={element.id} src={element.src} alt={element.label} title={element.label} onMouseDown={(event) => handleElementDragStart(event, element)} style={{ ...editorStyles.canvasImage, left: element.x, top: element.y, position: 'absolute', outline: selectedElementId === element.id ? '2px solid #ec4899' : 'none' }} />
+                : <div
+                    key={element.id}
+                    contentEditable={element.type === 'text'}
+                    suppressContentEditableWarning
+                    onBlur={(event) => element.type === 'text' && updateElement(element.id, { label: event.currentTarget.textContent })}
+                    onMouseDown={(event) => handleElementDragStart(event, element)}
+                    style={{
+                      ...(element.type === 'shape' ? editorStyles.canvasShape : element.type === 'ai' ? editorStyles.canvasAi : editorStyles.canvasElement),
+                      position: 'absolute', left: element.x, top: element.y,
+                      fontSize: element.type === 'text' ? element.fontSize : undefined,
+                      fontWeight: element.type === 'text' ? element.fontWeight : undefined,
+                      fontStyle: element.type === 'text' ? element.fontStyle : undefined,
+                      color: element.type === 'text' ? element.color : undefined,
+                      textAlign: element.type === 'text' ? element.textAlign : undefined,
+                      outline: selectedElementId === element.id ? '2px solid #ec4899' : 'none',
+                    }}
+                  >{element.label}</div>
             ))}
           </div>
         </main>
@@ -774,6 +994,54 @@ const editorStyles = {
     fontSize: '13px',
     textAlign: 'left',
   },
+  formatPanel: {
+    marginTop: '18px',
+    paddingTop: '14px',
+    borderTop: '1px solid rgba(255, 255, 255, 0.1)',
+  },
+  formatTitle: {
+    margin: '0 0 12px',
+    fontSize: '12px',
+    color: '#f8fafc',
+  },
+  fieldLabel: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '8px',
+    marginBottom: '10px',
+    color: '#94a3b8',
+    fontSize: '11px',
+  },
+  fieldInput: {
+    width: '64px',
+    padding: '4px 6px',
+    backgroundColor: '#111827',
+    border: '1px solid rgba(255, 255, 255, 0.15)',
+    borderRadius: '4px',
+    color: '#f8fafc',
+  },
+  colorInput: {
+    width: '64px',
+    height: '24px',
+    padding: 0,
+    border: 0,
+    backgroundColor: 'transparent',
+  },
+  formatButtons: {
+    display: 'flex',
+    gap: '5px',
+    marginBottom: '12px',
+  },
+  smallFormatButton: {
+    width: '28px',
+    height: '26px',
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    border: '1px solid rgba(255, 255, 255, 0.12)',
+    borderRadius: '4px',
+    color: '#f8fafc',
+    cursor: 'pointer',
+  },
   colorSwatch: {
     width: '100%',
     border: '1px solid rgba(255, 255, 255, 0.15)',
@@ -792,6 +1060,44 @@ const editorStyles = {
     fontSize: '12px',
     color: '#cbd5e1',
   },
+  layerItemActive: {
+    border: '1px solid #ec4899',
+    backgroundColor: 'rgba(236, 72, 153, 0.12)',
+  },
+  layerNameInput: {
+    width: '100%',
+    boxSizing: 'border-box',
+    backgroundColor: 'transparent',
+    border: 0,
+    outline: 0,
+    color: '#cbd5e1',
+    fontSize: '12px',
+    marginBottom: '7px',
+  },
+  layerControls: {
+    display: 'flex',
+    gap: '4px',
+  },
+  layerButton: {
+    minWidth: '22px',
+    height: '21px',
+    padding: '0 4px',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    border: '0',
+    borderRadius: '3px',
+    color: '#cbd5e1',
+    cursor: 'pointer',
+  },
+  layerDeleteButton: {
+    minWidth: '22px',
+    height: '21px',
+    padding: '0 4px',
+    backgroundColor: 'rgba(248, 113, 113, 0.15)',
+    border: '0',
+    borderRadius: '3px',
+    color: '#f87171',
+    cursor: 'pointer',
+  },
   canvasArea: {
     flex: 1,
     backgroundColor: '#131b2e',
@@ -802,6 +1108,7 @@ const editorStyles = {
     overflow: 'auto',
   },
   canvas: {
+    position: 'relative',
     backgroundColor: '#ffffff',
     borderRadius: '4px',
     boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)',
