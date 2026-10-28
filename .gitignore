@@ -426,3 +426,49 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+# =================( Node & General )=================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-debug.log*
+
+# =================( Environment Variables )=================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# =================( Build & Output )=================
+# React / Frontend build output
+build/
+dist/
+.output/
+
+# =================( Logs & OS Files )=================
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+lerna-debug.log*
+.DS_Store
+Thumbs.db
+
+# =================( IDE & Editor Configs )=================
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# =================( Testing & Coverage )=================
+coverage/
+.nyc_output/
+
+# =================( Misc )=================
+.turbo/
+.parcel-cache/
