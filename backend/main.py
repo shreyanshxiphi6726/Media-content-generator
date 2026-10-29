@@ -1,6 +1,7 @@
 import os
 import re
 import json
+from html import escape
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -19,9 +20,9 @@ except ImportError:
     MongoClient = None
 
 load_dotenv()
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
-MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "media_content_generator")
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+MONGODB_URI = os.getenv("MONGODB_URI")
+MONGODB_DATABASE = os.getenv("MONGODB_DATABASE")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN")
 
 app = FastAPI(title="Media Content Generator API", version="1.0.0")
 app.add_middleware(
@@ -86,6 +87,42 @@ def replace_placeholders(value: Any, data: dict[str, Any]) -> Any:
         return str(current)
 
     return re.sub(r"{{\s*([^{}]+?)\s*}}", resolve, value)
+
+
+def render_document_svg(document: dict[str, Any]) -> str:
+    dimensions = document.get("canvasDimensions", {})
+    width = str(dimensions.get("width", "600px"))
+    height = str(dimensions.get("height", "400px"))
+    width_number = re.sub(r"[^0-9.]", "", width) or "600"
+    height_number = re.sub(r"[^0-9.]", "", height) or "400"
+    background = escape(str(document.get("canvasBackground", "#ffffff")), quote=True)
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width_number} {height_number}">',
+        f'<rect width="100%" height="100%" fill="{background}"/>',
+    ]
+    for element in document.get("canvasElements", []):
+        if element.get("visible") is False:
+            continue
+        x, y = element.get("x", 40), element.get("y", 40)
+        element_type = element.get("type", "text")
+        if element_type == "image" and element.get("src", "").startswith("data:image/"):
+            parts.append(f'<image href="{escape(element["src"], quote=True)}" x="{x}" y="{y}" width="80%" height="55%" preserveAspectRatio="xMidYMid meet"/>')
+            continue
+        if element_type == "shape":
+            parts.append(f'<rect x="{x}" y="{y}" width="72" height="40" rx="6" fill="#c4b5fd" stroke="#7c3aed" stroke-width="2"/>')
+            continue
+        label = escape(str(element.get("label", "")))
+        align = element.get("textAlign", "left")
+        anchor = {"left": "start", "center": "middle", "right": "end"}.get(align, "start")
+        text_x = x if align == "left" else x + (120 if align == "center" else 240)
+        parts.append(
+            f'<text x="{text_x}" y="{y}" text-anchor="{anchor}" dominant-baseline="hanging" '
+            f'font-family="Arial, sans-serif" font-size="{element.get("fontSize", 24)}" '
+            f'font-weight="{element.get("fontWeight", "400")}" font-style="{element.get("fontStyle", "normal")}" '
+            f'fill="{escape(str(element.get("color", "#0f172a")), quote=True)}">{label}</text>'
+        )
+    parts.append("</svg>")
+    return "".join(parts)
 
 
 def serialize_project(project: dict[str, Any]) -> dict[str, Any]:
@@ -249,4 +286,18 @@ def download_generated_mcp(batch_id: str, item_id: str):
         content=json.dumps(item["mcp"], indent=2),
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{item["fileName"]}"'},
+    )
+
+
+@app.get("/api/batches/{batch_id}/items/{item_id}/image")
+def download_generated_image(batch_id: str, item_id: str):
+    batch = get_batch_or_404(batch_id)
+    item = next((candidate for candidate in batch["items"] if candidate["id"] == item_id), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Generated poster not found")
+    file_name = item["fileName"].removesuffix(".mcp") + ".svg"
+    return Response(
+        content=render_document_svg(item["mcp"]["document"]),
+        media_type="image/svg+xml",
+        headers={"Content-Disposition": f'attachment; filename="{file_name}"'},
     )

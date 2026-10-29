@@ -472,3 +472,4 @@ coverage/
 # =================( Misc )=================
 .turbo/
 .parcel-cache/
+*n8n.json
